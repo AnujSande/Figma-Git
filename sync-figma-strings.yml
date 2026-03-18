@@ -1,0 +1,123 @@
+name: 🎨 Sync Figma Strings
+
+# ─── Triggers ─────────────────────────────────────────────────────────────────
+on:
+  # 1. Manual run (useful for initial setup or ad-hoc syncs)
+  workflow_dispatch:
+    inputs:
+      node_ids:
+        description: "Figma node IDs to sync (comma-separated). Leave blank to auto-detect Ready for Dev."
+        required: false
+        default: ""
+
+  # 2. Scheduled polling — checks every 15 minutes for new "Ready for Dev" screens
+  schedule:
+    - cron: "*/15 * * * *"
+
+  # 3. Webhook trigger — fired by your relay when Figma POSTs a version update
+  #    Your relay calls:
+  #      POST https://api.github.com/repos/{owner}/{repo}/dispatches
+  #      { "event_type": "figma-ready-for-dev", "client_payload": { "node_ids": "1:23,4:56" } }
+  repository_dispatch:
+    types: [figma-ready-for-dev]
+
+# ─── Permissions ──────────────────────────────────────────────────────────────
+permissions:
+  contents: write  # Needed to push the updated strings file
+
+# ─── Jobs ─────────────────────────────────────────────────────────────────────
+jobs:
+  sync-figma-strings:
+    name: Sync Strings from Figma
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+      # ── 2. Restore dev-status cache (for scheduled polling) ────────────────
+      - name: Restore dev-status cache
+        uses: actions/cache@v4
+        with:
+          path: .figma-dev-status-cache.json
+          key: figma-dev-status-${{ github.run_id }}
+          restore-keys: figma-dev-status-
+
+      # ── 3. Resolve which node IDs to sync ──────────────────────────────────
+      #    Priority: manual input > webhook payload > auto-detect from Figma
+      - name: Resolve node IDs
+        id: resolve
+        env:
+          FIGMA_TOKEN: ${{ secrets.FIGMA_TOKEN }}
+          FIGMA_FILE_ID: ${{ secrets.FIGMA_FILE_ID }}
+        run: |
+          # From manual dispatch
+          MANUAL_IDS="${{ github.event.inputs.node_ids }}"
+          # From repository_dispatch webhook payload
+          WEBHOOK_IDS="${{ github.event.client_payload.node_ids }}"
+
+          if [ -n "$MANUAL_IDS" ]; then
+            echo "Source: manual input"
+            echo "node_ids=$MANUAL_IDS" >> $GITHUB_OUTPUT
+            echo "should_sync=true"     >> $GITHUB_OUTPUT
+
+          elif [ -n "$WEBHOOK_IDS" ]; then
+            echo "Source: webhook payload"
+            echo "node_ids=$WEBHOOK_IDS" >> $GITHUB_OUTPUT
+            echo "should_sync=true"      >> $GITHUB_OUTPUT
+
+          else
+            echo "Source: auto-detect (polling Figma for READY_FOR_DEV)"
+            # check-dev-status.js prints node IDs to stdout, exits 2 if nothing new
+            if NODE_IDS=$(node scripts/check-dev-status.js 2>/dev/null); then
+              echo "node_ids=$NODE_IDS" >> $GITHUB_OUTPUT
+              echo "should_sync=true"   >> $GITHUB_OUTPUT
+            else
+              EXIT_CODE=$?
+              if [ "$EXIT_CODE" -eq 2 ]; then
+                echo "No new Ready-for-Dev screens. Skipping sync."
+              else
+                echo "check-dev-status.js failed with exit code $EXIT_CODE"
+                exit 1
+              fi
+              echo "should_sync=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      # ── 4. Fetch text nodes from Figma & write JSON ────────────────────────
+      - name: Sync strings from Figma
+        if: steps.resolve.outputs.should_sync == 'true'
+        env:
+          FIGMA_TOKEN: ${{ secrets.FIGMA_TOKEN }}
+          FIGMA_FILE_ID: ${{ secrets.FIGMA_FILE_ID }}
+          FIGMA_NODE_IDS: ${{ steps.resolve.outputs.node_ids }}
+          OUTPUT_PATH: strings/en.json
+        run: node scripts/sync-figma-strings.js
+
+      # ── 5. Commit & push if the strings file changed ───────────────────────
+      - name: Commit updated strings
+        if: steps.resolve.outputs.should_sync == 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add strings/
+          # Only commit if there are actual changes
+          if git diff --staged --quiet; then
+            echo "No string changes to commit."
+          else
+            TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+            git commit -m "chore(strings): sync Figma strings [$TIMESTAMP] [skip ci]"
+            git push
+            echo "✅ Strings committed and pushed."
+          fi
+
+      # ── 6. Save updated dev-status cache ───────────────────────────────────
+      - name: Save dev-status cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .figma-dev-status-cache.json
+          key: figma-dev-status-${{ github.run_id }}
